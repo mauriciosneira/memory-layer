@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memory-layer"
+version = "0.1.0"
+description = "A DynamoDB-backed BaseStore for LangGraph — cross-thread memory for agents, no Postgres/pgvector required"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Mauricio Neira" },
+]
+keywords = ["langgraph", "langchain", "dynamodb", "memory", "agents", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "pydantic>=2.0",
+    "boto3>=1.35",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "langchain-openai>=0.2",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "moto[dynamodb]>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mauriciosneira/memory-layer"
+Issues = "https://github.com/mauriciosneira/memory-layer/issues"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
