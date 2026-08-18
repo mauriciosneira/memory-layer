@@ -45,7 +45,7 @@ pip install "langgraph-dynamodb-store[semantic]"
 
 ## DynamoDB table
 
-One table, one GSI. The base table's `sort_key` (namespace + memory id, `begins_with`-friendly) makes a namespace prefix like `("user", "123")` correctly match everything stored under it (including deeper namespaces like `("user", "123", "preferences")`). The `owner_id-created_at-index` GSI is what `search()` actually queries — `ScanIndexForward=False` on `gsi_sort_key` gives true recency order from DynamoDB itself, not a re-sort of whatever page happened to be fetched (which silently returns the wrong "most recent N" once a namespace has more memories than fit in one page — see [CHANGELOG](MEMORY_LAYER.md)). Create it however you provision infra (CDK/Terraform/console) — here's the raw shape via the AWS CLI, if you just want to try it out:
+One table, one GSI. `owner_id` is the **full namespace** (one DynamoDB partition per distinct namespace — e.g. one per end user), so `search()` requires the exact namespace things were written under; it does not do hierarchical prefix matching across depths (see [Scopes](#scopes) and [CHANGELOG](MEMORY_LAYER.md) for why an earlier design that supported this was reverted — it collapsed every namespace sharing a first segment into one shared partition). The `owner_id-created_at-index` GSI is what `search()` actually queries — `ScanIndexForward=False` on `gsi_sort_key` gives true recency order from DynamoDB itself, not a re-sort of whatever page happened to be fetched (which silently returns the wrong "most recent N" once a namespace has more memories than fit in one page). Create it however you provision infra (CDK/Terraform/console) — here's the raw shape via the AWS CLI, if you just want to try it out:
 
 ```bash
 aws dynamodb create-table \
@@ -146,6 +146,8 @@ A namespace is just a tuple — `memory-layer` doesn't prescribe what it means, 
 ("user", cognito_sub)        # private to one user
 ("instance", tenant_id)      # shared across every user of one tenant
 ```
+
+`search()` always uses the exact namespace passed to it as the DynamoDB partition key — pick a shape you'll query with consistently (matching what you `put()` with), not one you plan to search with a shorter prefix later.
 
 ## Roadmap
 

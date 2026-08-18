@@ -106,20 +106,22 @@ La combinación más robusta. Explícita para capturar intenciones directas del 
 
 > **Nota (v0.2.0):** este modelo cambió respecto a la versión original de este documento — el diseño de abajo (`owner_id` = `":".join(namespace)`, con una GSI `owner_id-created_at-index`) no soportaba prefix search de verdad (`search(("user","123"))` no encontraba memorias guardadas en `("user","123","preferences")`) y tenía colisión de separador si algún segmento del namespace contenía `":"`.
 >
-> **Nota (v0.3.0):** v0.2.0 sacó la GSI para resolver lo de arriba, y con eso rompió la recencia: `search()` ordenaba por `created_at` *después* de paginar, así que una vez que un namespace tenía más memorias de las que entran en una página, el "top N más reciente" pasaba a ser un slice arbitrario (orden lexicográfico de `sort_key`, no de tiempo) — verificado empíricamente con 40 memorias de ~40KB, `limit=5` devolvía los índices 23-19 en vez de 39-35. v0.3.0 reintroduce la GSI, pero con otro rol: `gsi_sort_key` (no `created_at` solo, para evitar empates en el mismo milisegundo). El schema real, ver `src/memory_layer/store.py`:
+> **Nota (v0.3.0):** v0.2.0 sacó la GSI para resolver lo de arriba, y con eso rompió la recencia: `search()` ordenaba por `created_at` *después* de paginar, así que una vez que un namespace tenía más memorias de las que entran en una página, el "top N más reciente" pasaba a ser un slice arbitrario (orden lexicográfico de `sort_key`, no de tiempo) — verificado empíricamente con 40 memorias de ~40KB, `limit=5` devolvía los índices 23-19 en vez de 39-35. v0.3.0 reintroduce la GSI, pero con otro rol: `gsi_sort_key` (no `created_at` solo, para evitar empates en el mismo milisegundo).
+>
+> **Nota (v0.4.0):** v0.2.0/v0.3.0 particionaban por `namespace[0]` solo, para soportar `search()` con un prefijo más corto que el namespace de escritura. Eso colapsaba **todos** los namespaces que comparten el primer segmento (p. ej. todos los `"user"` de todo el deployment) en una sola partición de DynamoDB. Verificado empíricamente: la memoria de un principal se volvía irrecuperable en cuanto ~150 principales no relacionados, bajo el mismo primer segmento, escribían más recientemente — el `Limit` de la query acota los items *leídos* de esa partición compartida antes de aplicar cualquier filtro de prefijo. Ni el uso documentado de este mismo paquete (`("user", user_id)`, donde `search()` siempre corre con el mismo namespace exacto que el `put()`) ni ningún caller real necesitan prefix search genuino entre profundidades — así que v0.4.0 vuelve a particionar por el **namespace completo** (como v0.1.0, máxima cardinalidad) y **elimina el soporte de prefix search jerárquico**: `search()` requiere el namespace exacto con el que se escribió; un namespace más corto consulta una partición distinta y devuelve una lista vacía, no un error (no hay forma de distinguir, solo a partir del input, "namespace exacto de un solo segmento" de "prefijo jerárquico de un namespace más profundo"). El schema real, ver `src/memory_layer/store.py`:
 
 | Campo | Tipo | Descripción |
 |---|---|---|
-| `owner_id` | PK (String, tabla base y GSI) | Solo el primer segmento del namespace — `namespace[0]` |
-| `sort_key` | SK (String, tabla base) | Resto del namespace + `memory_id`, unidos con `\x1f` (no `:` — evita colisión con IDs reales que contengan `:`, como ARNs) |
-| `gsi_sort_key` | SK (String, GSI `owner_id-created_at-index`) | `created_at` + `\x1f` + `sort_key` — recencia real vía `ScanIndexForward=False`, con el `sort_key` como desempate determinístico |
-| `namespace` | String | El tuple de namespace original, serializado como JSON — para reconstruir `Item.namespace` sin volver a parsear la sort key |
+| `owner_id` | PK (String, tabla base y GSI) | El namespace **completo**, unido con `\x1f` (no `:` — evita colisión con IDs reales que contengan `:`, como ARNs) — una partición de DynamoDB por namespace distinto |
+| `sort_key` | SK (String, tabla base) | `memory_id`, verbatim |
+| `gsi_sort_key` | SK (String, GSI `owner_id-created_at-index`) | `created_at` + `\x1f` + `memory_id` — recencia real vía `ScanIndexForward=False`, con `memory_id` como desempate determinístico |
+| `namespace` | String | El tuple de namespace original, serializado como JSON — para reconstruir `Item.namespace` sin volver a parsear el owner_id |
 | `memory_id` | String | La key original, verbatim |
 | `value` | String | JSON del contenido (`content`, `type`, etc.) |
 | `created_at` / `updated_at` | String | ISO 8601 UTC |
 | `ttl` | Number | TTL Unix timestamp — presente solo si el tipo tiene TTL por defecto o se pasó `ttl=` explícito en `put()` |
 
-**Con una GSI** (`owner_id-created_at-index`, proyección `ALL`). `search()` consulta la GSI directamente con `ScanIndexForward=False` para recencia real del lado del server; el prefijo de namespace se aplica como `FilterExpression` sobre `sort_key` (ya no es un atributo clave en este índice). El costo: con un prefijo muy selectivo, DynamoDB lee (y cobra) items que el filtro después descarta — aceptable para el caso de uso ("últimas N memorias de un usuario").
+**Con una GSI** (`owner_id-created_at-index`, proyección `ALL`). `search()` consulta la GSI directamente con `ScanIndexForward=False` para recencia real del lado del server — ya no hace falta ningún `FilterExpression` de prefijo, porque `owner_id` ya es el namespace exacto.
 
 ---
 

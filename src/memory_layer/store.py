@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import boto3
-from boto3.dynamodb.conditions import Attr, Key
+from boto3.dynamodb.conditions import Key
 from langgraph.store.base import (
     BaseStore,
     GetOp,
@@ -25,27 +25,31 @@ logger = logging.getLogger(__name__)
 
 _MAX_SEARCH_PAGES = 10
 _TTL_SECONDS_BY_TYPE = {"episodic": 90 * 24 * 60 * 60}  # semantic/procedural: no default ttl, never expire
-# Namespace segments and memory ids are joined into a single sort key for DynamoDB's
-# begins_with prefix queries. \x1f (ASCII unit separator) is used instead of a printable
-# character like ":" specifically because it can't appear in tenant ids, emails, or ARNs —
-# a ":" join collided with real-world identifiers containing ":" and corrupted round-trips.
-_SEP = "\x1f"
 _RECENCY_INDEX_NAME = "owner_id-created_at-index"
+# owner_id is the FULL namespace, joined with \x1f (not ":" — real identifiers like ARNs or
+# emails can contain ":", which would corrupt the round-trip). This makes owner_id one
+# partition per distinct namespace (e.g. per end user), not per namespace[0] — a prior design
+# partitioned on namespace[0] alone to support search() with a shorter-than-write namespace
+# prefix, which collapsed every namespace sharing that first segment (e.g. every "user" in the
+# whole deployment) into a single DynamoDB partition. Confirmed empirically: a principal's own
+# memory became unrecoverable once ~150 other principals under the same first segment had
+# written more recently (Query's Limit caps items *read* from the shared partition before the
+# prefix filter is even applied). Neither this package's own documented usage (`("user", id)`,
+# search always run with the exact same namespace as the write) nor Atlas's real call sites
+# ever search with a namespace shorter than what was written — so this trades an unused,
+# dangerous capability (hierarchical prefix search across depths) for correctness and
+# cardinality on the path that's actually exercised. See MEMORY_LAYER.md for the full history.
+_SEP = "\x1f"
 
 
-def _sort_key(namespace: tuple[str, ...], memory_id: str) -> str:
-    return _SEP.join((*namespace[1:], memory_id))
+def _owner_id(namespace: tuple[str, ...]) -> str:
+    return _SEP.join(namespace)
 
 
-def _sort_key_prefix(namespace_prefix: tuple[str, ...]) -> str:
-    rest = namespace_prefix[1:]
-    return _SEP.join(rest) + _SEP if rest else ""
-
-
-def _gsi_sort_key(created_at: str, sort_key: str) -> str:
+def _gsi_sort_key(created_at: str, memory_id: str) -> str:
     # created_at alone isn't unique — two writes in the same millisecond would tie and
-    # leave their relative order to chance. Appending sort_key breaks the tie deterministically.
-    return f"{created_at}{_SEP}{sort_key}"
+    # leave their relative order to chance. Appending memory_id breaks the tie deterministically.
+    return f"{created_at}{_SEP}{memory_id}"
 
 
 def _row_to_item(row: dict[str, Any]) -> Item:
@@ -148,14 +152,12 @@ class DynamoDBStore(BaseStore):
         return await asyncio.to_thread(self.batch, list(ops))
 
     def _handle_get(self, op: GetOp) -> Item | None:
-        resp = self._table.get_item(
-            Key={"owner_id": op.namespace[0], "sort_key": _sort_key(op.namespace, op.key)}
-        )
+        resp = self._table.get_item(Key={"owner_id": _owner_id(op.namespace), "sort_key": op.key})
         row = resp.get("Item")
         return _row_to_item(row) if row else None
 
     def _handle_put(self, op: PutOp) -> None:
-        pk = {"owner_id": op.namespace[0], "sort_key": _sort_key(op.namespace, op.key)}
+        pk = {"owner_id": _owner_id(op.namespace), "sort_key": op.key}
         if op.value is None:
             self._table.delete_item(Key=pk)
             return
@@ -174,14 +176,17 @@ class DynamoDBStore(BaseStore):
             ":now": now,
             # Only takes effect on first write (if_not_exists) — an update to an existing
             # memory keeps its original creation-time position in the recency index.
-            ":gsk": _gsi_sort_key(now, pk["sort_key"]),
+            ":gsk": _gsi_sort_key(now, op.key),
         }
 
         ttl_seconds = _resolve_ttl_seconds(op)
         expression_names["#ttl"] = "ttl"
         if ttl_seconds is not None:
             update_expression += ", #ttl = :ttl"
-            expression_values[":ttl"] = int(datetime.now(timezone.utc).timestamp()) + ttl_seconds
+            # DynamoDB's boto3 resource layer rejects Python float values outright
+            # ("Float types are not supported") — op.ttl (minutes) can be a float per the
+            # BaseStore contract, so ttl_seconds can be too (e.g. ttl=1.5 -> 90.0 seconds).
+            expression_values[":ttl"] = int(datetime.now(timezone.utc).timestamp() + ttl_seconds)
         else:
             # Without this, a memory that had a ttl set (e.g. created as "episodic") and
             # later updated to a type with no default ttl (e.g. "semantic") would keep
@@ -196,6 +201,12 @@ class DynamoDBStore(BaseStore):
         )
 
     def _handle_search(self, op: SearchOp) -> list[SearchItem]:
+        """namespace_prefix must be the exact namespace items were written under — this store
+        does not support searching with a namespace shorter than the write-time namespace (see
+        the module-level comment on _SEP for why). A shorter prefix queries a partition where
+        nothing was written and returns an empty list, not an error — there is no way to tell
+        "caller searched a bare/exact single-segment namespace" from "caller intended a
+        hierarchical prefix over a deeper namespace" from the input alone."""
         if op.query is not None:
             raise NotImplementedError(
                 "DynamoDBStore does not implement semantic search (SearchOp.query) — "
@@ -208,22 +219,15 @@ class DynamoDBStore(BaseStore):
         last_evaluated_key: dict[str, Any] | None = None
         pages = 0
 
-        sort_key_prefix = _sort_key_prefix(op.namespace_prefix)
-        # Recency (ScanIndexForward=False on gsi_sort_key) is now a server-side property of
-        # the query, not a client-side re-sort — a re-sort only orders whatever page(s) were
+        # Recency (ScanIndexForward=False on gsi_sort_key) is a server-side property of the
+        # query, not a client-side re-sort — a re-sort only orders whatever page(s) were
         # already fetched, which silently stops being "the N most recent" once a namespace
         # has enough memories to span more than one page.
         query_kwargs_base: dict[str, Any] = {
             "IndexName": _RECENCY_INDEX_NAME,
-            "KeyConditionExpression": Key("owner_id").eq(op.namespace_prefix[0]),
+            "KeyConditionExpression": Key("owner_id").eq(_owner_id(op.namespace_prefix)),
             "ScanIndexForward": False,
         }
-        # sort_key is no longer a key attribute of this index, so the namespace prefix is
-        # applied as a FilterExpression instead of a KeyConditionExpression — DynamoDB still
-        # rejects begins_with() with an empty-string operand, so omit it for a top-level-only
-        # prefix (e.g. ("user",)), same as before.
-        if sort_key_prefix:
-            query_kwargs_base["FilterExpression"] = Attr("sort_key").begins_with(sort_key_prefix)
 
         while len(matches) < op.offset + op.limit and pages < _MAX_SEARCH_PAGES:
             query_kwargs = dict(query_kwargs_base)
@@ -245,7 +249,7 @@ class DynamoDBStore(BaseStore):
         if last_evaluated_key is not None and pages >= _MAX_SEARCH_PAGES:
             logger.warning(
                 "DynamoDBStore.search hit _MAX_SEARCH_PAGES (%d) before exhausting "
-                "results for namespace prefix %r — returned results may be incomplete.",
+                "results for namespace %r — returned results may be incomplete.",
                 _MAX_SEARCH_PAGES,
                 op.namespace_prefix,
             )

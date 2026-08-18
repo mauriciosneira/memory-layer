@@ -16,9 +16,9 @@ NAMESPACE = ("user", "test-user-123")
 
 
 def _raw(store, namespace, memory_id):
-    from memory_layer.store import _sort_key
+    from memory_layer.store import _owner_id
 
-    return store._table.get_item(Key={"owner_id": namespace[0], "sort_key": _sort_key(namespace, memory_id)})["Item"]
+    return store._table.get_item(Key={"owner_id": _owner_id(namespace), "sort_key": memory_id})["Item"]
 
 
 def test_put_and_get(store):
@@ -89,7 +89,7 @@ def test_search_limit_and_offset(store):
     assert {r.key for r in page1}.isdisjoint({r.key for r in page2})
 
 
-def test_search_isolated_by_top_level_namespace(store):
+def test_search_isolated_by_full_namespace(store):
     other_namespace = ("user", "other-user")
     store.put(NAMESPACE, "mem-1", {"content": "my memory", "type": "semantic"})
     store.put(other_namespace, "mem-2", {"content": "their memory", "type": "semantic"})
@@ -139,6 +139,16 @@ def test_explicit_ttl_minutes_overrides_the_type_default(store):
     assert int(raw["ttl"]) <= int(time.time()) + 5 * 60 + 1
 
 
+def test_explicit_ttl_accepts_a_float_number_of_minutes(store):
+    """Regression test: op.ttl (BaseStore contract) can be a float, and DynamoDB's boto3
+    resource layer raises TypeError on a raw Python float — must be coerced to int."""
+    store.put(NAMESPACE, "mem-1", {"content": "short-lived note", "type": "semantic"}, ttl=1.5)
+
+    raw = _raw(store, NAMESPACE, "mem-1")
+    assert "ttl" in raw
+    assert int(raw["ttl"]) <= int(time.time()) + 90 + 1
+
+
 def test_search_paginates_past_the_first_page_when_filter_thins_it_out(store):
     for i in range(15):
         memory_type = "semantic" if i == 14 else "episodic"
@@ -148,20 +158,6 @@ def test_search_paginates_past_the_first_page_when_filter_thins_it_out(store):
 
     assert len(results) == 1
     assert results[0].value["type"] == "semantic"
-
-
-def test_search_recency_is_correct_across_multiple_pages(store):
-    """Regression test: recency must be a property of the query (GSI + ScanIndexForward),
-    not a client-side re-sort of whatever page(s) happened to be fetched — a re-sort over
-    a partial page returns the most recent items *of that page*, not of the whole
-    namespace, the moment there's more data than fits in one page."""
-    padding = "x" * 40_000
-    for i in range(40):
-        store.put(NAMESPACE, f"mem-{i:03d}", {"content": padding, "type": "semantic", "seq": i})
-
-    results = store.search(NAMESPACE, limit=5)
-
-    assert [r.value["seq"] for r in results] == [39, 38, 37, 36, 35]
 
 
 def test_list_namespaces_raises_not_implemented(store):
@@ -178,42 +174,57 @@ def test_search_with_query_raises_not_implemented(store):
         store.search(NAMESPACE, query="something relevant", limit=10)
 
 
-class TestNamespacePrefixSearch:
-    """BaseStore's own contract documents namespace_prefix as a hierarchical *prefix* —
-    searching by a shorter namespace than what memories were stored under must still
-    find them. An exact-match implementation would return an empty list here, silently."""
+def test_search_recency_is_correct_across_multiple_pages(store):
+    """Regression test: recency must be a property of the query (GSI + ScanIndexForward),
+    not a client-side re-sort of whatever page(s) happened to be fetched — a re-sort over
+    a partial page returns the most recent items *of that page*, not of the whole
+    namespace, the moment there's more data than fits in one page."""
+    padding = "x" * 40_000
+    for i in range(40):
+        store.put(NAMESPACE, f"mem-{i:03d}", {"content": padding, "type": "semantic", "seq": i})
 
-    def test_search_by_a_shorter_prefix_finds_deeper_namespaces(self, store):
+    results = store.search(NAMESPACE, limit=5)
+
+    assert [r.value["seq"] for r in results] == [39, 38, 37, 36, 35]
+
+
+def test_namespace_segments_containing_a_colon_survive_a_round_trip(store):
+    namespace = ("instance", "arn:aws:iam::123456789012:role/acme")
+    store.put(namespace, "mem-1", {"content": "tenant-scoped fact", "type": "semantic"})
+
+    item = store.get(namespace, "mem-1")
+    results = store.search(namespace, limit=10)
+
+    assert item.namespace == namespace
+    assert results[0].namespace == namespace
+
+
+class TestPartitionIsolation:
+    """Regression coverage for the hot-partition/cardinality bug: owner_id must be the
+    FULL namespace, not just namespace[0] — otherwise every namespace sharing that first
+    segment (e.g. every "user" in the whole deployment) collapses into one DynamoDB
+    partition, and a principal's own memories can become unrecoverable once enough other,
+    unrelated principals under the same first segment have written more recently (Query's
+    Limit caps items read from the shared partition before any prefix filter applies)."""
+
+    def test_a_principals_memory_is_found_despite_heavy_traffic_from_unrelated_principals(self, store):
+        store.put(("user", "the-one-we-care-about"), "mem-ours", {"content": "important", "type": "semantic"})
+
+        for i in range(150):
+            store.put(("user", f"unrelated-{i}"), "mem-noise", {"content": "noise", "type": "semantic"})
+
+        results = store.search(("user", "the-one-we-care-about"), limit=10)
+
+        assert len(results) == 1
+        assert results[0].key == "mem-ours"
+
+    def test_search_requires_the_exact_write_time_namespace(self, store):
+        """Documents the accepted trade-off: unlike the prior schema, this store does not
+        support a namespace_prefix shorter than what was written — it queries a specific,
+        different partition and returns nothing, silently. Neither this package's own
+        documented usage nor any real caller needs cross-depth prefix search in practice."""
         store.put(("user", "123", "preferences"), "mem-1", {"content": "likes dark mode", "type": "semantic"})
 
         results = store.search(("user", "123"), limit=10)
 
-        assert len(results) == 1
-        assert results[0].namespace == ("user", "123", "preferences")
-
-    def test_search_by_top_level_prefix_finds_everything_under_it(self, store):
-        store.put(("user", "123"), "mem-1", {"content": "a", "type": "semantic"})
-        store.put(("user", "123", "preferences"), "mem-2", {"content": "b", "type": "semantic"})
-        store.put(("user", "456"), "mem-3", {"content": "c", "type": "semantic"})
-
-        results = store.search(("user",), limit=10)
-
-        assert {r.key for r in results} == {"mem-1", "mem-2", "mem-3"}
-
-    def test_sibling_ids_sharing_a_numeric_prefix_do_not_false_match(self, store):
-        store.put(("user", "123"), "mem-1", {"content": "a", "type": "semantic"})
-        store.put(("user", "1234"), "mem-2", {"content": "b", "type": "semantic"})
-
-        results = store.search(("user", "123"), limit=10)
-
-        assert {r.key for r in results} == {"mem-1"}
-
-    def test_namespace_segments_containing_the_join_separator_survive_a_round_trip(self, store):
-        namespace = ("instance", "arn:aws:iam::123456789012:role/acme")
-        store.put(namespace, "mem-1", {"content": "tenant-scoped fact", "type": "semantic"})
-
-        item = store.get(namespace, "mem-1")
-        results = store.search(("instance",), limit=10)
-
-        assert item.namespace == namespace
-        assert results[0].namespace == namespace
+        assert results == []
