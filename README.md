@@ -45,26 +45,17 @@ pip install "langgraph-dynamodb-store[semantic]"
 
 ## DynamoDB table
 
-One table, one GSI. Create it however you provision infra (CDK/Terraform/console) — here's the raw shape via the AWS CLI, if you just want to try it out:
+One table, no secondary index needed — `search()` queries the base table directly using `begins_with` on a composite sort key, so a namespace prefix like `("user", "123")` correctly matches everything stored under it (including deeper namespaces like `("user", "123", "preferences")`), not just an exact match. Create it however you provision infra (CDK/Terraform/console) — here's the raw shape via the AWS CLI, if you just want to try it out:
 
 ```bash
 aws dynamodb create-table \
   --table-name my-app-memories \
   --attribute-definitions \
       AttributeName=owner_id,AttributeType=S \
-      AttributeName=memory_id,AttributeType=S \
-      AttributeName=created_at,AttributeType=S \
+      AttributeName=sort_key,AttributeType=S \
   --key-schema \
       AttributeName=owner_id,KeyType=HASH \
-      AttributeName=memory_id,KeyType=RANGE \
-  --global-secondary-indexes '[{
-      "IndexName": "owner_id-created_at-index",
-      "KeySchema": [
-          {"AttributeName": "owner_id", "KeyType": "HASH"},
-          {"AttributeName": "created_at", "KeyType": "RANGE"}
-      ],
-      "Projection": {"ProjectionType": "ALL"}
-  }]' \
+      AttributeName=sort_key,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST
 
 # Optional but recommended — lets episodic memories actually expire instead of

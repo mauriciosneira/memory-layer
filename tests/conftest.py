@@ -19,22 +19,11 @@ def dynamodb_table():
             TableName="test-memories",
             KeySchema=[
                 {"AttributeName": "owner_id", "KeyType": "HASH"},
-                {"AttributeName": "memory_id", "KeyType": "RANGE"},
+                {"AttributeName": "sort_key", "KeyType": "RANGE"},
             ],
             AttributeDefinitions=[
                 {"AttributeName": "owner_id", "AttributeType": "S"},
-                {"AttributeName": "memory_id", "AttributeType": "S"},
-                {"AttributeName": "created_at", "AttributeType": "S"},
-            ],
-            GlobalSecondaryIndexes=[
-                {
-                    "IndexName": "owner_id-created_at-index",
-                    "KeySchema": [
-                        {"AttributeName": "owner_id", "KeyType": "HASH"},
-                        {"AttributeName": "created_at", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                }
+                {"AttributeName": "sort_key", "AttributeType": "S"},
             ],
             BillingMode="PAY_PER_REQUEST",
         )

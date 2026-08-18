@@ -104,20 +104,19 @@ La combinación más robusta. Explícita para capturar intenciones directas del 
 
 ## Data Model — DynamoDB
 
-**Tabla**: `memory-layer-{stage}-memories`
+> **Nota (v0.2.0):** este modelo cambió respecto a la versión original de este documento — el diseño de abajo (`owner_id` = `":".join(namespace)`, con una GSI `owner_id-created_at-index`) no soportaba prefix search de verdad (`search(("user","123"))` no encontraba memorias guardadas en `("user","123","preferences")`) y tenía colisión de separador si algún segmento del namespace contenía `":"`. El schema real, ver `src/memory_layer/store.py`:
 
 | Campo | Tipo | Descripción |
 |---|---|---|
-| `owner_id` | PK (String) | Scope + id: `"user:abc"`, `"instance:bunker"` |
-| `memory_id` | SK (String) | UUID |
-| `type` | String | `"semantic"` \| `"episodic"` \| `"procedural"` |
-| `content` | String | Texto libre de la memoria |
-| `created_at` | String | ISO 8601 UTC |
-| `expires_at` | Number | TTL Unix timestamp (opcional — memorias semánticas no expiran) |
-| `embedding` | String | JSON serializado del vector (Phase 2) |
-| `session_id` | String | Thread que originó esta memoria (trazabilidad) |
+| `owner_id` | PK (String) | Solo el primer segmento del namespace — `namespace[0]` |
+| `sort_key` | SK (String) | Resto del namespace + `memory_id`, unidos con `\x1f` (no `:` — evita colisión con IDs reales que contengan `:`, como ARNs) |
+| `namespace` | String | El tuple de namespace original, serializado como JSON — para reconstruir `Item.namespace` sin volver a parsear la sort key |
+| `memory_id` | String | La key original, verbatim |
+| `value` | String | JSON del contenido (`content`, `type`, etc.) |
+| `created_at` / `updated_at` | String | ISO 8601 UTC |
+| `ttl` | Number | TTL Unix timestamp — presente solo si el tipo tiene TTL por defecto o se pasó `ttl=` explícito en `put()` |
 
-**GSI**: `owner_id-created_at-index` para fetch por recencia.
+**Sin GSI.** `search()` hace `begins_with` sobre `sort_key` directo en la tabla base — el orden por recencia se hace en Python después de traer los matches, ya no vía un índice ordenado por `created_at`.
 
 ---
 
