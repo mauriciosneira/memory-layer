@@ -24,6 +24,17 @@ def dynamodb_table():
             AttributeDefinitions=[
                 {"AttributeName": "owner_id", "AttributeType": "S"},
                 {"AttributeName": "sort_key", "AttributeType": "S"},
+                {"AttributeName": "gsi_sort_key", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "owner_id-created_at-index",
+                    "KeySchema": [
+                        {"AttributeName": "owner_id", "KeyType": "HASH"},
+                        {"AttributeName": "gsi_sort_key", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
             ],
             BillingMode="PAY_PER_REQUEST",
         )

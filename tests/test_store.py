@@ -150,6 +150,20 @@ def test_search_paginates_past_the_first_page_when_filter_thins_it_out(store):
     assert results[0].value["type"] == "semantic"
 
 
+def test_search_recency_is_correct_across_multiple_pages(store):
+    """Regression test: recency must be a property of the query (GSI + ScanIndexForward),
+    not a client-side re-sort of whatever page(s) happened to be fetched — a re-sort over
+    a partial page returns the most recent items *of that page*, not of the whole
+    namespace, the moment there's more data than fits in one page."""
+    padding = "x" * 40_000
+    for i in range(40):
+        store.put(NAMESPACE, f"mem-{i:03d}", {"content": padding, "type": "semantic", "seq": i})
+
+    results = store.search(NAMESPACE, limit=5)
+
+    assert [r.value["seq"] for r in results] == [39, 38, 37, 36, 35]
+
+
 def test_list_namespaces_raises_not_implemented(store):
     from langgraph.store.base import ListNamespacesOp
 

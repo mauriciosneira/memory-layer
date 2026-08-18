@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langgraph-dynamodb-store"
-version = "0.2.0"
+version = "0.3.0"
 description = "A DynamoDB-backed BaseStore for LangGraph — cross-thread memory for agents, no Postgres/pgvector required"
 readme = "README.md"
 license = "MIT"

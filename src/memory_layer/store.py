@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 from langgraph.store.base import (
     BaseStore,
     GetOp,
@@ -30,6 +30,7 @@ _TTL_SECONDS_BY_TYPE = {"episodic": 90 * 24 * 60 * 60}  # semantic/procedural: n
 # character like ":" specifically because it can't appear in tenant ids, emails, or ARNs —
 # a ":" join collided with real-world identifiers containing ":" and corrupted round-trips.
 _SEP = "\x1f"
+_RECENCY_INDEX_NAME = "owner_id-created_at-index"
 
 
 def _sort_key(namespace: tuple[str, ...], memory_id: str) -> str:
@@ -39,6 +40,12 @@ def _sort_key(namespace: tuple[str, ...], memory_id: str) -> str:
 def _sort_key_prefix(namespace_prefix: tuple[str, ...]) -> str:
     rest = namespace_prefix[1:]
     return _SEP.join(rest) + _SEP if rest else ""
+
+
+def _gsi_sort_key(created_at: str, sort_key: str) -> str:
+    # created_at alone isn't unique — two writes in the same millisecond would tie and
+    # leave their relative order to chance. Appending sort_key breaks the tie deterministically.
+    return f"{created_at}{_SEP}{sort_key}"
 
 
 def _row_to_item(row: dict[str, Any]) -> Item:
@@ -156,7 +163,8 @@ class DynamoDBStore(BaseStore):
         now = datetime.now(timezone.utc).isoformat()
         update_expression = (
             "SET #v = :v, #ns = :ns, memory_id = :mid, updated_at = :now, "
-            "created_at = if_not_exists(created_at, :now)"
+            "created_at = if_not_exists(created_at, :now), "
+            "gsi_sort_key = if_not_exists(gsi_sort_key, :gsk)"
         )
         expression_names: dict[str, str] = {"#v": "value", "#ns": "namespace"}
         expression_values: dict[str, Any] = {
@@ -164,6 +172,9 @@ class DynamoDBStore(BaseStore):
             ":ns": json.dumps(list(op.namespace)),
             ":mid": op.key,
             ":now": now,
+            # Only takes effect on first write (if_not_exists) — an update to an existing
+            # memory keeps its original creation-time position in the recency index.
+            ":gsk": _gsi_sort_key(now, pk["sort_key"]),
         }
 
         ttl_seconds = _resolve_ttl_seconds(op)
@@ -198,15 +209,24 @@ class DynamoDBStore(BaseStore):
         pages = 0
 
         sort_key_prefix = _sort_key_prefix(op.namespace_prefix)
-        key_condition = Key("owner_id").eq(op.namespace_prefix[0])
-        # DynamoDB rejects begins_with() with an empty-string operand on a key attribute —
-        # a top-level-only prefix (e.g. ("user",)) legitimately means "match everything
-        # under this partition", which is exactly what omitting the condition does.
+        # Recency (ScanIndexForward=False on gsi_sort_key) is now a server-side property of
+        # the query, not a client-side re-sort — a re-sort only orders whatever page(s) were
+        # already fetched, which silently stops being "the N most recent" once a namespace
+        # has enough memories to span more than one page.
+        query_kwargs_base: dict[str, Any] = {
+            "IndexName": _RECENCY_INDEX_NAME,
+            "KeyConditionExpression": Key("owner_id").eq(op.namespace_prefix[0]),
+            "ScanIndexForward": False,
+        }
+        # sort_key is no longer a key attribute of this index, so the namespace prefix is
+        # applied as a FilterExpression instead of a KeyConditionExpression — DynamoDB still
+        # rejects begins_with() with an empty-string operand, so omit it for a top-level-only
+        # prefix (e.g. ("user",)), same as before.
         if sort_key_prefix:
-            key_condition &= Key("sort_key").begins_with(sort_key_prefix)
+            query_kwargs_base["FilterExpression"] = Attr("sort_key").begins_with(sort_key_prefix)
 
         while len(matches) < op.offset + op.limit and pages < _MAX_SEARCH_PAGES:
-            query_kwargs: dict[str, Any] = {"KeyConditionExpression": key_condition}
+            query_kwargs = dict(query_kwargs_base)
             if last_evaluated_key is not None:
                 query_kwargs["ExclusiveStartKey"] = last_evaluated_key
 
@@ -230,7 +250,4 @@ class DynamoDBStore(BaseStore):
                 op.namespace_prefix,
             )
 
-        # The table has no secondary sort order once queries are scoped by begins_with
-        # instead of a GSI keyed on created_at — recency ordering is done here instead.
-        matches.sort(key=lambda r: r["created_at"], reverse=True)
         return [_row_to_search_item(r) for r in matches[op.offset : op.offset + op.limit]]
