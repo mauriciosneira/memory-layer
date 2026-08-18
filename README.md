@@ -1,5 +1,8 @@
 # memory-layer
 
+[![Tests](https://github.com/mauriciosneira/memory-layer/actions/workflows/test.yml/badge.svg)](https://github.com/mauriciosneira/memory-layer/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **A DynamoDB-backed `BaseStore` for LangGraph — cross-thread memory for your agents without standing up Postgres/pgvector.**
 
 LangGraph's checkpointer persists state *inside* a thread — when a user opens a new conversation, the graph starts from zero. The `store` protocol is LangGraph's answer to that: memory that survives *across* threads, shared by every session for the same user (or the same tenant). LangGraph ships an official store for Postgres. If your stack is already DynamoDB — which a lot of serverless/Fargate deployments are — there wasn't an official option. `memory-layer` is that option.
@@ -31,13 +34,13 @@ That's the whole integration. No new infra beyond one DynamoDB table you probabl
 ## Install
 
 ```bash
-pip install memory-layer
+pip install langgraph-dynamodb-store
 ```
 
 Want LLM-driven extraction? `MemoryWriter` takes any LangChain `BaseChatModel` — bring the one you already use, no extra install needed. `numpy`/`langchain-openai` are only required for the semantic-retrieval extra (see [Roadmap](#roadmap)):
 
 ```bash
-pip install "memory-layer[semantic]"
+pip install "langgraph-dynamodb-store[semantic]"
 ```
 
 ## DynamoDB table

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "memory-layer"
+name = "langgraph-dynamodb-store"
 version = "0.1.0"
 description = "A DynamoDB-backed BaseStore for LangGraph — cross-thread memory for agents, no Postgres/pgvector required"
 readme = "README.md"
@@ -43,6 +43,13 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/mauriciosneira/memory-layer"
 Issues = "https://github.com/mauriciosneira/memory-layer/issues"
+
+# Distribution name (langgraph-dynamodb-store) differs from the importable module
+# (memory_layer) — hatchling's src-layout auto-detection derives the package dir from
+# the project name by default, which would look for src/langgraph_dynamodb_store and
+# fail to find anything. Point it at the real package explicitly instead.
+[tool.hatch.build.targets.wheel]
+packages = ["src/memory_layer"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
